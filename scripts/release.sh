@@ -9,6 +9,15 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/.build"
 DIST_DIR="$PROJECT_DIR/dist"
 
+# Load .env (not committed) for signing config: TEAM_NAME, TEAM_ID,
+# SELF_SIGN_IDENTITY. In CI these come from the environment/secrets instead.
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/.env"
+    set +a
+fi
+
 # Use the provided version (CI passes the tag), or derive one from git
 VERSION="${1:-$(git -C "$PROJECT_DIR" describe --tags --always --dirty 2>/dev/null | sed 's/^v//')}"
 
@@ -25,6 +34,92 @@ echo "Building growlrrr v$VERSION for release..."
 VERSION="$VERSION" "$SCRIPT_DIR/bundle.sh" release
 
 APP_BUNDLE="$BUILD_DIR/release/growlrrr.app"
+
+# Re-sign with a stable self-signed identity when no Developer ID is configured.
+#
+# bundle.sh signs with "Developer ID Application: ..." if TEAM_NAME/TEAM_ID are
+# set, otherwise it falls back to ad-hoc ("-"). Ad-hoc signatures have no stable
+# identity, so Gatekeeper/keychain trust and TCC permission grants don't persist
+# across rebuilds. A named self-signed certificate gives the app a consistent
+# signing identity between releases without needing an Apple Developer account.
+#
+# Set SELF_SIGN_IDENTITY (in .env or the environment) to the common name of a
+# self-signed code-signing certificate. If it doesn't exist in the keychain yet,
+# we create one. This only runs when TEAM_NAME/TEAM_ID are absent -- a real
+# Developer ID always takes precedence.
+if [[ -z "${TEAM_NAME:-}" || -z "${TEAM_ID:-}" ]] && [[ -n "${SELF_SIGN_IDENTITY:-}" ]]; then
+    echo ""
+    echo "Signing with self-signed identity: $SELF_SIGN_IDENTITY"
+
+    # Create the self-signed code-signing certificate if it's not already in a
+    # keychain. `security find-identity -v -p codesigning` lists valid
+    # code-signing identities; we match on the common name.
+    if ! security find-identity -v -p codesigning | grep -qF "$SELF_SIGN_IDENTITY"; then
+        echo "Certificate not found; creating self-signed certificate..."
+
+        # certificate.pl ships with the codesigning tools; if it's unavailable
+        # we build the cert with a scripted Certificate Assistant request.
+        CERT_TMP="$(mktemp -d)"
+        trap 'rm -rf "$CERT_TMP"' EXIT
+
+        # OpenSSL config for a self-signed cert with the codeSigning EKU.
+        cat > "$CERT_TMP/cert.cnf" <<EOF
+[ req ]
+distinguished_name = dn
+x509_extensions    = v3
+prompt             = no
+[ dn ]
+CN = $SELF_SIGN_IDENTITY
+[ v3 ]
+basicConstraints       = critical,CA:false
+keyUsage               = critical,digitalSignature
+extendedKeyUsage       = critical,codeSigning
+EOF
+
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$CERT_TMP/key.pem" \
+            -out "$CERT_TMP/cert.pem" \
+            -days 3650 \
+            -config "$CERT_TMP/cert.cnf"
+
+        # Bundle key + cert into a PKCS#12 for import (empty passphrase).
+        openssl pkcs12 -export \
+            -inkey "$CERT_TMP/key.pem" \
+            -in "$CERT_TMP/cert.pem" \
+            -out "$CERT_TMP/cert.p12" \
+            -passout pass:
+
+        # Import into the login keychain. -T authorises codesign to use the key
+        # without an interactive prompt on each signing.
+        LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+        security import "$CERT_TMP/cert.p12" \
+            -k "$LOGIN_KEYCHAIN" \
+            -P "" \
+            -T /usr/bin/codesign
+
+        # Trust the cert for code signing so Gatekeeper accepts it locally.
+        sudo security add-trusted-cert -d \
+            -r trustAsRoot \
+            -p codeSign \
+            -k /Library/Keychains/System.keychain \
+            "$CERT_TMP/cert.pem" || \
+            echo "  WARNING: could not add cert to system trust (continuing)"
+
+        rm -rf "$CERT_TMP"
+        trap - EXIT
+    fi
+
+    # Re-sign the bundle with the named self-signed identity. Same options as a
+    # Developer ID sign so the resulting bundle is structured consistently;
+    # hardened runtime is fine for local/self-signed distribution.
+    codesign --force --deep \
+        --options runtime \
+        --sign "$SELF_SIGN_IDENTITY" \
+        "$APP_BUNDLE"
+
+    codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+    echo "Self-signed signing complete."
+fi
 
 # Notarize if credentials are available, otherwise skip (e.g. for source builds).
 if [[ -n "${TEAM_ID:-}" && -n "${APPLE_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
